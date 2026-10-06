@@ -7716,6 +7716,7 @@ int redisFork(int purpose) {
          */
         server.in_fork_child = purpose;
         setupChildSignalHandlers();
+        crashTimerInit();
         setOOMScoreAdj(CONFIG_OOM_BGCHILD);
         updateDictResizePolicy();
         dismissMemoryInChild();

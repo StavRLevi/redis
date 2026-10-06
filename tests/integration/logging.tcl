@@ -92,6 +92,19 @@ if {!$::valgrind} {
         }
     }
 
+    # test that a healthy crash report finishes before the crash report
+    # deadline kills the process (the deadline is Linux-only)
+    if {$threads_mngr_supported} {
+        set server_path [tmpdir server_crash_timer.log]
+        start_server [list overrides [list dir $server_path crash-handler-timeout 2 crash-memcheck-enabled no]] {
+            test "Crash report deadline does not cut a healthy crash report" {
+                catch {r debug segfault}
+                $check_cb "*crashed by signal*"
+                wait_for_log_messages 0 {"*REDIS BUG REPORT END*"} 0 100 100
+            }
+        }
+    }
+
     # test DEBUG SIGALRM being non-fatal
     set server_path [tmpdir server3.log]
     start_server [list overrides [list dir $server_path]] {

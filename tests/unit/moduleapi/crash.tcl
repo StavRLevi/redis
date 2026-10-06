@@ -61,6 +61,28 @@ if {!$::valgrind && !$::tsan} {
         }
     }
 
+    # The crash report deadline (crash-handler-timeout) is only compiled on Linux.
+    if {[get_system_name] eq {linux}} {
+        start_server {tags {"modules external:skip"}} {
+            r module load $testmodule hang
+            r config set crash-handler-timeout 2
+
+            test {Crash report deadline kills a stuck crash report} {
+                set pid [s process_id]
+                catch {r debug segfault}
+                # The module's info callback never returns.
+                wait_for_log_messages 0 {"*MODULES INFO OUTPUT*"} 0 100 100
+                wait_for_condition 100 100 {
+                    [process_is_alive $pid] == 0
+                } else {
+                    fail "process is still alive after crash-handler-timeout"
+                }
+                # Killed in the middle of the report.
+                assert_equal 0 [count_log_message 0 "REDIS BUG REPORT END"]
+            }
+        }
+    }
+
     start_server {tags {"modules external:skip"}} {
         r module load $testmodule
 

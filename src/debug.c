@@ -60,6 +60,64 @@ static pthread_mutexattr_t bug_report_start_attr;
 static pthread_mutex_t signal_handler_lock;
 static pthread_mutexattr_t signal_handler_lock_attr;
 static volatile int signal_handler_lock_initialized = 0;
+
+/* Crash report deadline. Parts of a crash report can hang (backtrace() takes
+ * the loader lock, module info callbacks run arbitrary code), and then the
+ * process never exits or dumps core. The timer sends SIGQUIT, which Redis
+ * does not handle, so on expiry the kernel kills the process and dumps core
+ * without running any of our code. */
+#ifdef HAVE_CRASH_TIMER
+static timer_t crash_timer;
+static int crash_timer_ok = 0;
+#endif
+
+/* Arm the deadline, or disarm it with 0. Async-signal-safe in practice:
+ * sigaction() is, and timer_settime() is a plain syscall on Linux whose lazy
+ * binding crashTimerInit() already resolved. */
+static void crashTimerSet(int seconds) {
+#ifdef HAVE_CRASH_TIMER
+    if (!crash_timer_ok) return;
+    if (seconds) {
+        /* SIGQUIT may be inherited as ignored, or handled by a module. */
+        struct sigaction act;
+        sigemptyset(&act.sa_mask);
+        act.sa_flags = 0;
+        act.sa_handler = SIG_DFL;
+        sigaction(SIGQUIT, &act, NULL);
+    }
+    struct itimerspec its = {{0, 0}, {seconds, 0}};
+    timer_settime(crash_timer, 0, &its, NULL);
+#else
+    UNUSED(seconds);
+#endif
+}
+
+/* Called at startup and in fork children, which do not inherit POSIX timers. */
+void crashTimerInit(void) {
+#ifdef HAVE_CRASH_TIMER
+    struct sigevent sev;
+    sigset_t quit;
+
+    /* Threads inherit the mask, and we may have been started with SIGQUIT blocked. */
+    sigemptyset(&quit);
+    sigaddset(&quit, SIGQUIT);
+    pthread_sigmask(SIG_UNBLOCK, &quit, NULL);
+
+    memset(&sev, 0, sizeof(sev));
+    sev.sigev_notify = SIGEV_SIGNAL;
+    sev.sigev_signo = SIGQUIT;
+    /* Without this flag, crashTimerSet() would use an unset timer_t, which can
+     * name a timer someone else created. */
+    crash_timer_ok = timer_create(CLOCK_MONOTONIC, &sev, &crash_timer) == 0;
+    if (!crash_timer_ok) {
+        serverLog(LL_WARNING, "Failed to create the crash report timer: %s", strerror(errno));
+        return;
+    }
+    /* Resolve timer_settime() now, not at crash time under the loader lock. */
+    crashTimerSet(0);
+#endif
+}
+
 /* Forward declarations */
 int bugReportStart(void);
 void printCrashReport(void);
@@ -1407,6 +1465,10 @@ int bugReportStart(void) {
     pthread_mutex_lock(&bug_report_start_mutex);
     if (bug_report_start == 0) {
         bug_report_start = 1;
+        /* Signals, asserts and panics all start here. Arming only on the first
+         * report means a crash inside the report can't extend the deadline. A
+         * second thread waiting on signal_handler_lock is covered by this one. */
+        crashTimerSet(server.crash_handler_timeout);
         serverLogRaw(LL_WARNING|LL_RAW,
         "\n\n=== REDIS BUG REPORT START: Cut & paste starting from here ===\n");
         pthread_mutex_unlock(&bug_report_start_mutex);
@@ -2430,12 +2492,19 @@ int memtest_test_linux_anonymous_maps(void) {
         regions++;
     }
 
+    /* This loop's time grows with memory size, but it takes no locks, so it
+     * can be slow without being stuck. Pause the crash report deadline for it
+     * only, so the timeout doesn't depend on instance size. killThreads() and
+     * the fopen() above, and dumpCodeAroundEIP() later, can block and stay
+     * covered. */
+    crashTimerSet(0);
     int errors = 0;
     for (j = 0; j < regions; j++) {
         if (write(fd,".",1) == -1) { /* Nothing to do. */ }
         errors += memtest_preserving_test((void*)start_vect[j],size_vect[j],1);
         if (write(fd, errors ? "E" : "O",1) == -1) { /* Nothing to do. */ }
     }
+    crashTimerSet(server.crash_handler_timeout);
     if (write(fd,"\n",1) == -1) { /* Nothing to do. */ }
 
     /* NOTE: It is very important to close the file descriptor only now
@@ -2618,6 +2687,8 @@ void setupDebugSigHandlers(void) {
     setupStacktracePipe();
 
     setupSigSegvHandler();
+
+    crashTimerInit();
 
     struct sigaction act;
 
@@ -2907,9 +2978,14 @@ static size_t get_ready_to_signal_threads_tids(int sig_num, pid_t tids[TIDS_MAX_
     snprintf_async_signal_safe(path_buff, PATH_MAX, "/proc/%d/task", getpid());
 
     int dir;
-    if (-1 == (dir = open(path_buff,  O_RDONLY | O_DIRECTORY))) return 0;
+    if (-1 == (dir = open(path_buff,  O_RDONLY | O_DIRECTORY))) {
+        serverLogFromHandler(LL_WARNING,
+            "get_ready_to_signal_threads_tids(): Failed to open %s, errno=%d", path_buff, errno);
+        return 0;
+    }
 
     size_t tids_count = 0;
+    size_t threads_seen = 0;
     pid_t calling_tid = syscall(SYS_gettid);
     int current_thread_index = -1;
     long nread;
@@ -2934,6 +3010,7 @@ static size_t get_ready_to_signal_threads_tids(int sig_num, pid_t tids[TIDS_MAX_
            long tid;
            string2l(entry->d_name, strlen(entry->d_name), &tid);
 
+            ++threads_seen;
             if(!is_thread_ready_to_signal(path_buff, entry->d_name, sig_num)) continue;
 
             if(tid == calling_tid) {
@@ -2962,6 +3039,14 @@ static size_t get_ready_to_signal_threads_tids(int sig_num, pid_t tids[TIDS_MAX_
     }
 
     close(dir);
+
+    /* 0 ready threads is either a failed scan or every thread blocking the
+     * signal, e.g. while stuck inside an earlier stack collection. */
+    if (tids_count == 0) {
+        serverLogFromHandler(LL_WARNING,
+            "get_ready_to_signal_threads_tids(): %lu threads found, none can receive signal %d",
+            (unsigned long)threads_seen, sig_num);
+    }
 
     return tids_count;
 }

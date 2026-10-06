@@ -72,6 +72,11 @@
 #define HAVE_BACKTRACE 1
 #endif
 
+/* Crash report deadline: needs timer_create(), which macOS lacks. */
+#ifdef __linux__
+#define HAVE_CRASH_TIMER 1
+#endif
+
 /* MSG_NOSIGNAL. */
 #ifdef __linux__
 #define HAVE_MSG_NOSIGNAL 1
