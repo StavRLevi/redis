@@ -2444,6 +2444,7 @@ void initServerConfig(void) {
                                       is initialized. */
     server.defrag_frag_cache.cronloops = -1; /* Mark the defrag fragmentation cache as stale */
     server.timezone = getTimeZone(); /* Initialized by tzset(). */
+    server.cpu_schedstat_fd = -1;
     server.configfile = NULL;
     server.executable = NULL;
     server.arch_bits = (sizeof(long) == 8) ? 64 : 32;
@@ -3125,6 +3126,7 @@ void initServer(void) {
     const char *clk_msg = monotonicInit(monotonicLogCallback);
     serverLog(LL_NOTICE, "monotonic clock: %s", clk_msg);
     /* Initial CPU window, until the first afterSleep(). */
+    cpuSampleInit();
     cpuSampleTake(&server.cpu_checkpoint);
     server.el = aeCreateEventLoop(server.maxclients+CONFIG_FDSET_INCR);
     if (server.el == NULL) {
@@ -7747,6 +7749,12 @@ void closeChildUnusedResourceAfterFork(void) {
      * be touched (or deleted) by the child (on exit / crash) */
     zfree(server.pidfile);
     server.pidfile = NULL;
+
+    /* It reads the parent's main thread. */
+    if (server.cpu_schedstat_fd != -1) {
+        close(server.cpu_schedstat_fd);
+        server.cpu_schedstat_fd = -1;
+    }
 }
 
 /* purpose is one of CHILD_TYPE_ types */

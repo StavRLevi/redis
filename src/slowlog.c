@@ -22,6 +22,7 @@
 #include "server.h"
 #include "slowlog.h"
 #include <sys/resource.h>
+#include <fcntl.h>
 
 /* Create a new slowlog entry.
  * Incrementing the ref count of all the objects retained is up to
@@ -147,13 +148,49 @@ static const char *offCpuLabel(long nvcsw, long nivcsw) {
     return "";
 }
 
-/* Sample the current thread: wall clock, CPU time, context switches. */
+/* Read the main thread's schedstat: CPU time and run-queue wait, in ns. One
+ * read gives both, so it replaces getrusage() rather than adding a call. */
+static int cpuSampleSchedstat(cpuSample *s) {
+    char buf[64], *p;
+    ssize_t n = pread(server.cpu_schedstat_fd, buf, sizeof(buf) - 1, 0);
+    if (n <= 0) return 0;
+    buf[n] = '\0';
+    unsigned long long cpu_ns = strtoull(buf, &p, 10);
+    if (p == buf) return 0;
+    unsigned long long wait_ns = strtoull(p, NULL, 10);
+    s->wall = getMonotonicUs();
+    s->cpu_us = (ustime_t)(cpu_ns / 1000);
+    s->run_delay_us = (ustime_t)(wait_ns / 1000);
+    s->nvcsw = s->nivcsw = 0;
+    return 1;
+}
+
+/* Use schedstat for the main thread when available (Linux with
+ * CONFIG_SCHED_INFO); otherwise samples come from getrusage(). */
+void cpuSampleInit(void) {
+#ifdef __linux__
+    server.cpu_schedstat_fd = open("/proc/thread-self/schedstat", O_RDONLY | O_CLOEXEC);
+    cpuSample s;
+    if (server.cpu_schedstat_fd != -1 && !cpuSampleSchedstat(&s)) {
+        close(server.cpu_schedstat_fd);
+        server.cpu_schedstat_fd = -1;
+    }
+#endif
+}
+
+/* Sample the current thread: wall clock, CPU time, run-queue wait (main
+ * thread with schedstat) or context switches (getrusage()). */
 void cpuSampleTake(cpuSample *s) {
+    if (server.cpu_schedstat_fd != -1 &&
+        pthread_equal(pthread_self(), server.main_thread_id) &&
+        cpuSampleSchedstat(s))
+        return;
     struct rusage ru;
     getrusage(COMMAND_RUSAGE_WHO, &ru);
     s->wall = getMonotonicUs();
     s->cpu_us = (ustime_t)ru.ru_utime.tv_sec*1000000 + ru.ru_utime.tv_usec +
                 (ustime_t)ru.ru_stime.tv_sec*1000000 + ru.ru_stime.tv_usec;
+    s->run_delay_us = -1;
     s->nvcsw = ru.ru_nvcsw;
     s->nivcsw = ru.ru_nivcsw;
 }
@@ -194,6 +231,7 @@ static void offCpuLog(const char *fmt, ...) {
  * Module thread: call() measured the command exactly into c->cpu_*. */
 void slowlogMeasureCpu(client *c, const cpuSample *start, slowlogCpu *m) {
     memset(m, 0, sizeof(*m));
+    m->wait_min = -1;
     m->measured = c->duration; /* Execution time only, without blocked time. */
     /* Shorter than the floor can never be reported (off_min <= measured), so
      * leave it unmeasured: the field stays 0. */
@@ -213,6 +251,13 @@ void slowlogMeasureCpu(client *c, const cpuSample *start, slowlogCpu *m) {
         m->off_min = m->measured - cpu;
         if (m->off_min > m->off_max) m->off_min = m->off_max;
         m->cpu = m->measured - m->off_min;
+        if (now.run_delay_us >= 0 && start->run_delay_us >= 0) {
+            /* Like off_min: only the wait that can't fit outside the command. */
+            ustime_t outside = window > m->measured ? window - m->measured : 0;
+            ustime_t wait = now.run_delay_us - start->run_delay_us;
+            m->wait_min = wait > outside ? wait - outside : 0;
+            if (m->wait_min > m->off_min) m->wait_min = m->off_min;
+        }
         m->nvcsw = now.nvcsw - start->nvcsw;
         m->nivcsw = now.nivcsw - start->nivcsw;
         server.cpu_checkpoint = now;
@@ -230,6 +275,13 @@ void slowlogMeasureCpu(client *c, const cpuSample *start, slowlogCpu *m) {
 void slowlogReportOffCpu(const slowlogCpu *m) {
     if (!m->sampled || m->off_min < CPU_STARVATION_MIN_OFFCPU_US) return;
     server.stat_slow_command_off_cpu_events++;
+    if (m->wait_min >= 0) {
+        offCpuLog("Slow command off-CPU: took %lldus, at least %lldus off-CPU "
+                  "(up to %lldus), at least %lldus waiting for a CPU",
+                  (long long)m->measured, (long long)m->off_min,
+                  (long long)m->off_max, (long long)m->wait_min);
+        return;
+    }
     offCpuLog("Slow command off-CPU%s: took %lldus, at least %lldus off-CPU "
               "(up to %lldus), %ld involuntary / %ld voluntary context switches",
               offCpuLabel(m->nvcsw, m->nivcsw), (long long)m->measured,
@@ -264,6 +316,16 @@ void offCpuCheckEventLoopCycle(ustime_t excluded_us) {
                      server.stat_numcommands - server.el_cmd_cnt_start :
                      server.stat_numcommands;
     server.stat_eventloop_off_cpu_events++;
+    if (now.run_delay_us >= 0 && server.el_cpu_start.run_delay_us >= 0) {
+        ustime_t wait = now.run_delay_us - server.el_cpu_start.run_delay_us;
+        if (wait < 0) wait = 0;
+        if (wait > off) wait = off;
+        offCpuLog("Event loop cycle off-CPU: took %lldus, %lldus off-CPU: %lldus waiting "
+                  "for a CPU, %lldus blocked, %lld commands",
+                  (long long)took, (long long)off, (long long)wait,
+                  (long long)(off - wait), cmds);
+        return;
+    }
     offCpuLog("Event loop cycle off-CPU%s: took %lldus, %lldus off-CPU, %lld commands, "
               "%ld involuntary / %ld voluntary context switches",
               offCpuLabel(nvcsw, nivcsw), (long long)took, (long long)off,

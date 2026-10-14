@@ -2092,6 +2092,7 @@ typedef struct hotkeyStats hotkeyStats;
 typedef struct cpuSample {
     monotime wall;
     ustime_t cpu_us;    /* user+sys */
+    ustime_t run_delay_us; /* Time runnable but not running; -1 if not known. */
     long nvcsw;
     long nivcsw;
 } cpuSample;
@@ -2274,6 +2275,7 @@ struct redisServer {
     long long stat_slow_command_off_cpu_events; /* Slowlog entries reported as off-CPU */
     long long stat_eventloop_off_cpu_events;     /* Event-loop cycles reported as off-CPU */
     cpuSample cpu_checkpoint;   /* Start of the main thread's CPU window. */
+    int cpu_schedstat_fd;       /* Main thread's /proc/thread-self/schedstat, or -1. */
     cpuSample el_cpu_start;     /* Sample at the start of the event-loop cycle; never
                                    moved by commands. */
     struct malloc_stats cron_malloc_stats; /* sampled in serverCron(). */
@@ -3936,6 +3938,7 @@ void preventCommandPropagation(client *c);
 void preventCommandAOF(client *c);
 void preventCommandReplication(client *c);
 void slowlogPushCurrentCommand(client *c, struct redisCommand *cmd, ustime_t duration, const cpuSample *cpu_start);
+void cpuSampleInit(void);
 void cpuSampleTake(cpuSample *s);
 void offCpuCheckEventLoopCycle(ustime_t excluded_us);
 void updateCommandLatencyHistogram(struct hdr_histogram** latency_histogram, int64_t duration_hist);

@@ -29,6 +29,7 @@ typedef struct slowlogCpu {
     ustime_t cpu;       /* Stored CPU time (main thread: measured - off_min). 0 if not sampled. */
     ustime_t off_min;   /* Off-CPU time that must be inside the command. */
     ustime_t off_max;   /* At most this much off-CPU time. */
+    ustime_t wait_min;  /* Run-queue wait that must be inside the command; -1 if not known. */
     long nvcsw, nivcsw; /* Context switches over the window. */
     int sampled;
 } slowlogCpu;

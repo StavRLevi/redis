@@ -72,8 +72,13 @@ start_server {tags {"slowlog"} overrides {slowlog-log-slower-than 1000000}} {
         set loglines [count_log_lines 0]
         set before [s slow_command_off_cpu_events]
         r debug sleep 0.2
-        wait_for_log_messages 0 {"*Slow command off-CPU*"} $loglines 50 100
+        set line [lindex [wait_for_log_messages 0 {"*Slow command off-CPU*"} $loglines 50 100] 0]
         assert_morethan_equal [s slow_command_off_cpu_events] [expr {$before + 1}]
+        # With schedstat (Linux) the sleep is off-CPU, mostly not waiting for a CPU.
+        if {[file readable /proc/thread-self/schedstat]} {
+            assert {[regexp {at least (\d+)us off-CPU .*at least (\d+)us waiting} $line -> off wait]}
+            assert {$wait < $off / 2}
+        }
     } {} {needs:debug external:skip}
 
     test {SLOWLOG - CPU-bound command gets a non-zero CPU estimate} {
@@ -585,6 +590,7 @@ if {$system_name eq {linux} && ![catch {exec which taskset renice}]} {
         test {SLOWLOG - CPU starvation is detected for a preempted command} {
             r config set slowlog-log-slower-than 1000
             set before [s slow_command_off_cpu_events]
+            set loglines [count_log_lines 0]
             set busy {}
             set err [catch {
                 start_busy_loops $starve_cpu busy
@@ -598,6 +604,12 @@ if {$system_name eq {linux} && ![catch {exec which taskset renice}]} {
             # Mostly off-CPU: the estimated CPU is well under half the duration.
             assert {[lindex $e 7] < [lindex $e 2] / 2}
             assert_morethan [s slow_command_off_cpu_events] $before
+            # With schedstat (Linux) the off-CPU time is mostly waiting for a CPU.
+            if {[file readable /proc/thread-self/schedstat]} {
+                set line [lindex [wait_for_log_messages 0 {"*Slow command off-CPU*"} $loglines 50 100] 0]
+                assert {[regexp {at least (\d+)us off-CPU .*at least (\d+)us waiting} $line -> off wait]}
+                assert {$wait > $off / 2}
+            }
         }
 
         test {SLOWLOG - CPU starvation between fast commands is detected per event-loop cycle} {
